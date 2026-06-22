@@ -1,0 +1,6 @@
+bin/
+obj/
+mtx/
+scratch/
+.trash/
+test-*.???
