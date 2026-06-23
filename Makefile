@@ -50,4 +50,4 @@ $(BIN_FOLDER)/$(MAIN_BIN): $(MAIN_SRC) $(OBJECTS)
 
 clean:
 	rm -rf $(BIN_FOLDER) $(OBJ_FOLDER)
-	mv -f test-*.??? .trash/
+	mv -f logs/test-*.??? .trash/
