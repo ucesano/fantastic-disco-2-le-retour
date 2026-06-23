@@ -1,6 +1,10 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
+#include <iostream>
+#include <sstream>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+
 #include <cuda_runtime.h>
 
 #ifdef __cplusplus
@@ -9,7 +13,6 @@ extern "C" {
 
 #include "include/mmio.h"
 #include "include/mmfmt.h"
-
 #include "include/mt19937ar.h"
 
 #ifdef __cplusplus
@@ -18,42 +21,49 @@ extern "C" {
 
 #include "include/bench.cuh"
 
-static void print_device_properties(cudaDeviceProp devProp)
+inline void print_device_properties(const cudaDeviceProp& dev, std::ostream& os)
 {
-    printf("Major revision number:         %d\n",  devProp.major);
-    printf("Minor revision number:         %d\n",  devProp.minor);
-    printf("Name:                          %s\n",  devProp.name);
-    printf("  Memory Clock rate:           %.0f Mhz\n", devProp.memoryClockRate * 1e-3f);
+    const double MHz       = 1e-3;
+    const double GBpsScale = 1.0e6;
 
-    printf("  Memory Bus Width:            %d bit\n",devProp.memoryBusWidth);
+    const int busBytes             = dev.memoryBusWidth / 8;
+    const double peakBandwidthGBps = 2.0 * dev.memoryClockRate * busBytes / GBpsScale;
 
-    printf("  Peak Memory Bandwidth:       %7.3f GB/s\n",2.0*devProp.memoryClockRate*(devProp.memoryBusWidth/8)/1.0e6);
-
-    printf("  Multiprocessors:             %3d\n",devProp.multiProcessorCount);
-    printf("  Maximum number of threads per multiprocessor:  %d\n",devProp.maxThreadsPerMultiProcessor);
-    printf("  Maximum number of threads per block:           %d\n",devProp.maxThreadsPerBlock);
-    printf("  Max dimension size of a thread block (x,y,z): (%d, %d, %d)\n",
-           devProp.maxThreadsDim[0], devProp.maxThreadsDim[1],devProp.maxThreadsDim[2]);
-    printf("  Max dimension size of a grid size    (x,y,z): (%d, %d, %d)\n",
-           devProp.maxGridSize[0], devProp.maxGridSize[1],devProp.maxGridSize[2]);
-    printf("  Total amount of shared memory per block:       %zu bytes\n", devProp.sharedMemPerBlock);
-    putchar(10);
+    os << "\n"
+       << "   Name . . . . . . . . . . . . . : " << dev.name << '\n'
+       << "   Major revision number  . . . . : " << dev.major << '\n'
+       << "   Minor revision number  . . . . : " << dev.minor << '\n'
+       << "   Memory Clock rate (MHz)  . . . : "
+       << static_cast<long>(dev.memoryClockRate * MHz) << '\n'
+       << "   Memory Bus Width (bits)  . . . : " << dev.memoryBusWidth << '\n'
+       << "   Peak Memory Bandwidth (GB/s) . : ";
+    os.setf(std::ios_base::fixed, std::ios_base::floatfield);
+    os.precision(3);
+    os << peakBandwidthGBps << '\n';
+    os.unsetf(std::ios_base::floatfield);
+    os << "   Multiprocessors  . . . . . . . : " << dev.multiProcessorCount << '\n'
+       << "   Max threads per block  . . . . : " << dev.maxThreadsPerBlock << '\n'
+       << "   Shared memory per block (bytes): " << dev.sharedMemPerBlock << '\n';
 }
 
-static void display_card_informations(void)
+inline void display_card_informations(std::ostream& os = std::cout)
 {
+    std::ostringstream oss;
+
     int devCount;
     cudaGetDeviceCount(&devCount);
-    printf("CUDA Device Query...\n");
-    printf("There are %d CUDA devices.\n", devCount);
+
+    oss << "CUDA Device Query...\nThere are " << devCount << " CUDA devices.\n";
 
     for (int i = 0; i < devCount; ++i)
     {
-        printf("\nCUDA Device #%d\n", i);
+        oss << "\nCUDA Device #" << i << '\n';
         cudaDeviceProp devProp;
         cudaGetDeviceProperties(&devProp, i);
-        print_device_properties(devProp);
+        print_device_properties(devProp, oss);
     }
+
+    os << oss.str() << std::endl;
 }
 
 int main(int argc, char ** argv)
