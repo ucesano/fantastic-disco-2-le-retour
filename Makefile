@@ -1,5 +1,6 @@
 CC=cc -O2 -Wall -Wextra
-NVCC=nvcc
+CXX=c++ -std=c++17 -O2 -Wall -Wextra
+NVCC=nvcc --arch=sm_80 -std=c++17 -O2 -Wall -Wextra
 
 LIBS=
 INCLUDES=-I../../
