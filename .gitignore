@@ -1,6 +1,7 @@
 bin/
 obj/
 mtx/
+logs/
 scratch/
 .trash/
 test-*.???
