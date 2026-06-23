@@ -7,9 +7,9 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --time=00:05:00
 
-#SBATCH --job-name=test
-#SBATCH --output=test-%j.out
-#SBATCH --error=test-%j.err
+#SBATCH --job-name=mpi_spmv_test
+#SBATCH --output=logs/test-%j.out
+#SBATCH --error=logs/test-%j.err
 
 module load CUDA/11.8.0
 
@@ -17,4 +17,4 @@ make
 
 hostname
 
-./bin/spmv mtx/Maragal_8.mtx
+./bin/spmv mtx/F1.mtx
