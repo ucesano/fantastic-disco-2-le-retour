@@ -182,8 +182,6 @@ int main(int argc, char ** argv)
     X = (float *) malloc(N * sizeof(float));
     for (i = 0; i < N; i++) X[i] = (float)genrand_real1() + 1.f;
 
-    struct results coo     = spmv_gpu_coo_prof(I, J, val, M, N, nz, row_nz, X);
-    struct results csr     = spmv_gpu_csr_prof(O, J, val, M, N, nz, row_nz, X);
     struct results csr_opt = spmv_gpu_csr_opt_prof(O, J, val, M, N, nz, row_nz, X);
 
     free(row_nz);
@@ -195,10 +193,7 @@ int main(int argc, char ** argv)
 
     display_card_informations();
 
-    fprintf(stdout, "file: %s\n", argv[1]);
-    print_results(coo, "coo");
-    print_results(csr, "csr");
-    print_results(csr_opt, "csr (warp)");
+    print_results(csr_opt, argv[1], "csr (w/ warp optimization)");
 
     return ret_code;
 }

@@ -3,43 +3,6 @@
 #include <stdlib.h>
 
 __global__
-void spmv_gpu_coo(const int *__restrict__ I,
-                  const int *__restrict__ J,
-                  const float *__restrict__ val,
-                  const int nz,
-                  const float *__restrict__ X,
-                  float *__restrict__ Y)
-{
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride = blockDim.x * gridDim.x;
-
-    for (int i = tid; i < nz; i += stride)
-        atomicAdd(&Y[I[i]], val[i] * X[J[i]]);
-}
-
-__global__
-void spmv_gpu_csr(const int *__restrict__ O,
-                  const int *__restrict__ J,
-                  const float *__restrict__ val,
-                  const int M,
-                  const float *__restrict__ X,
-                  float *__restrict__ Y)
-{
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (row < M)
-    {
-        float sum = 0.f;
-        int start = O[row];
-        int end   = O[row + 1];
-
-        for (int j = start; j < end; ++j) sum += val[j] * X[J[j]];
-
-        Y[row] = sum;
-    }
-}
-
-__global__
 void spmv_gpu_csr_opt(const int   *__restrict__ O,
                          const int   *__restrict__ J,
                          const float *__restrict__ val,
