@@ -22,7 +22,30 @@ extern "C" {
 
 #include "include/bench.cuh"
 
+#define CHECK_CUDA(call)                                  \
+    do {                                                  \
+        cudaError_t err = (call);                         \
+        if (err != cudaSuccess) {                         \
+            std::cerr << "CUDA error in " << __FILE__     \
+                      << ":" << __LINE__ << " : "         \
+                      << cudaGetErrorString(err) << "\n"; \
+            MPI_Abort(MPI_COMM_WORLD, err);               \
+        }                                                 \
+    } while (0)
 
+#define CHECK_MPI(call)                                   \
+    do {                                                  \
+        int err = (call);                                 \
+        if (err != MPI_SUCCESS) {                         \
+            char err_str[MPI_MAX_ERROR_STRING];           \
+            int err_len;                                  \
+            MPI_Error_string(err, err_str, &err_len);     \
+            std::cerr << "MPI error in "                  \
+                      << __FILE__ << ":" << __LINE__      \
+                      << " : " << err_str << "\n";        \
+            MPI_Abort(MPI_COMM_WORLD, err);               \
+        }                                                 \
+    } while (0)
 
 inline void print_device_properties(const cudaDeviceProp& dev, std::ostream& os)
 {
@@ -71,13 +94,13 @@ inline void display_card_informations(std::ostream& os = std::cout)
 
 int main(int argc, char ** argv)
 {
-    MPI_Init(&argc, &argv);
+    CHECK_MPI(MPI_Init(&argc, &argv));
 
     int rank, P;
-    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
-    MPI_Comm_size(MPI_COMM_WORLD, &P);
+    CHECK_MPI(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+    CHECK_MPI(MPI_Comm_size(MPI_COMM_WORLD, &P));
 
-    MPI_Finalize();
+    CHECK_MPI(MPI_Finalize());
 
     return 0;
 }
