@@ -1,10 +1,9 @@
-CC=cc -O2 -Wall -Wextra
-CXX=c++ -std=c++17 -O2 -Wall -Wextra
-NVCC=nvcc
+CC=mpicc -O2 -Wall -Wextra
+NVCC=nvcc -allow-unsupported-compiler
 
 LIBS=
 INCLUDES=-I../../
-LIB_FLAGS=-lm
+LIB_FLAGS=-lm -lmpi
 
 
 BIN_FOLDER := bin

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cmath>
 
+#include <mpi.h>
 #include <cuda_runtime.h>
 
 #ifdef __cplusplus
@@ -20,6 +21,8 @@ extern "C" {
 #endif
 
 #include "include/bench.cuh"
+
+
 
 inline void print_device_properties(const cudaDeviceProp& dev, std::ostream& os)
 {
@@ -68,7 +71,13 @@ inline void display_card_informations(std::ostream& os = std::cout)
 
 int main(int argc, char ** argv)
 {
-    display_card_informations();
+    MPI_Init(&argc, &argv);
+
+    int rank, P;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &P);
+
+    MPI_Finalize();
 
     return 0;
 }
