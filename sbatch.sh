@@ -3,9 +3,9 @@
 #SBATCH --account=gpu.computing26
 #SBATCH --nodes=1
 #SBATCH --ntasks=4
-#SBATCH --gres=gpu:0
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=1
-#SBATCH --time=00:02:00
+#SBATCH --time=00:05:00
 #SBATCH --mem=1G
 
 #SBATCH --job-name=mpi_spmv_test
@@ -17,11 +17,8 @@ export CUDAHOSTCXX=$(which gcc)
 module load OpenMPI
 module load CUDA/11.8.0
 
-gcc --version
-mpicc --version
-
-module list | grep -i cuda
+hostname
 
 make
 
-mpirun -np 4 ./bin/spmv mtx/F1.mtx
+mpirun -np 4 ./bin/spmv mtx/cage15.mtx
