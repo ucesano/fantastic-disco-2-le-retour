@@ -1,4 +1,4 @@
-CC=mpicc -O2 -Wall -Wextra
+CC=mpicc -O2 -Wall -Wextra -lcudart -lmpi
 NVCC=nvcc -allow-unsupported-compiler
 
 LIBS=
@@ -46,7 +46,7 @@ $(OBJ_FOLDER)/spmv_gpu.o: $(SRC_FOLDER)/spmv_gpu.cu
 
 $(BIN_FOLDER)/$(MAIN_BIN): $(MAIN_SRC) $(OBJECTS)
 	mkdir -p $(BIN_FOLDER)
-	$(NVCC) $^ -o $@ $(LIBS) $(INCLUDES) $(LIB_FLAGS)
+	$(NVCC) $^ -o $@ $(LIBS) $(INCLUDES) $(LIB_FLAGS) -lnvidia-ml -lmpi
 
 clean:
 	rm -rf $(BIN_FOLDER) $(OBJ_FOLDER)

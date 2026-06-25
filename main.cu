@@ -100,6 +100,17 @@ inline void display_card_informations(const int devCount, std::ostream& os = std
     os << oss.str() << std::endl;
 }
 
+__global__ void gatherXValues(float *toSend, float *xLocal, int *colsToServe, int n) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < n) toSend[k] = xLocal[colsToServe[k]];
+}
+
+__global__ void scatterXValues(float *xForKernel, float *xGhost, int *flatRequest, int n) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k < n) xForKernel[flatRequest[k]] = xGhost[k];
+}
+
+
 int main(int argc, char ** argv)
 {
     CHECK_MPI(MPI_Init(&argc, &argv));
@@ -212,8 +223,8 @@ int main(int argc, char ** argv)
     int N = 0;
     for (int r = rank; r < g_N; r += P) ++N;
 
-    std::vector<float> X(N);
     std::vector<float> Y(M);
+    std::vector<float> X(N);
 
     if (rank == 0)
     {
@@ -244,192 +255,150 @@ int main(int argc, char ** argv)
         MPI_Scatterv(nullptr, nullptr, nullptr, MPI_FLOAT, X.data(), N, MPI_FLOAT, 0, MPI_COMM_WORLD);
     }
 
-
-
-
-
     mm_sort_coo(I.data(), J.data(), val.data(), nz);
 
 
 
 
 
+    #if defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
+    if (rank == 0 && !MPIX_Query_cuda_support())
+        fprintf(stderr, "WARNING: MPI is NOT CUDA-aware at runtime\n");
+    #endif
 
 
 
 
-
-
-
-
-
-    // ---- Ghost columns: global cols we reference but don't own, grouped by owner ----
-    std::unordered_set<int>       ghost_entries;     // unique ghost columns
-    std::vector<std::vector<int>> need(P);           // need[p] = ghost cols owned by p
-
-    for (int i = 0; i < nz; ++i)
-    {
-        int c = J[i];
-        if (OWNER(c, P) != rank && ghost_entries.insert(c).second)
-            need[OWNER(c, P)].push_back(c);
+    // Phase 1
+    // 1. Unique remote columns grouped by owner rank.
+    std::vector<std::unordered_set<int>> needSet(P);
+    for (int k = 0; k < nz; ++k) {
+        int col = J[k];
+        if (OWNER(col, P) != rank) needSet[OWNER(col, P)].insert(col);
     }
 
-    // recv_counts[p] = #values we want FROM p ; send_counts[p] = #values p wants FROM us
-    std::vector<int> recv_counts(P), send_counts(P);
-    for (int p = 0; p < P; ++p) recv_counts[p] = (int)need[p].size();
-    CHECK_MPI(MPI_Alltoall(recv_counts.data(), 1, MPI_INT,
-                           send_counts.data(), 1, MPI_INT, MPI_COMM_WORLD));
-
-    std::vector<int> recv_displs(P, 0), send_displs(P, 0);
-    for (int p = 1; p < P; ++p)
-    {
-        recv_displs[p] = recv_displs[p-1] + recv_counts[p-1];
-        send_displs[p] = send_displs[p-1] + send_counts[p-1];
+    // recvCols[s] = sorted unique global cols we need FROM rank s.
+    std::vector<int> recvCounts(P, 0), recvDispls(P, 0);
+    std::vector<int> recvColsFlat;                 // concatenated, in rank order
+    for (int s = 0; s < P; ++s) {
+        std::vector<int> v(needSet[s].begin(), needSet[s].end());
+        std::sort(v.begin(), v.end());
+        recvDispls[s] = (int)recvColsFlat.size();
+        recvCounts[s] = (int)v.size();
+        recvColsFlat.insert(recvColsFlat.end(), v.begin(), v.end());
     }
-    int total_recv = recv_displs[P-1] + recv_counts[P-1];   // # ghosts we receive
-    int total_send = send_displs[P-1] + send_counts[P-1];   // # values others want
+    int G = (int)recvColsFlat.size();              // total ghost entries
 
-    // Flatten our requests (global col ids) and swap them for the requests aimed at us.
-    std::vector<int> recv_cols(total_recv), send_cols(total_send);
-    for (int p = 0; p < P; ++p)
-        std::copy(need[p].begin(), need[p].end(), recv_cols.begin() + recv_displs[p]);
+    // 2. After Alltoall, sendCounts[d] = how many of OUR entries rank d wants.
+    std::vector<int> sendCounts(P, 0), sendDispls(P, 0);
+    CHECK_MPI(MPI_Alltoall(recvCounts.data(), 1, MPI_INT,
+                        sendCounts.data(), 1, MPI_INT, MPI_COMM_WORLD));
+    int S = 0;
+    for (int d = 0; d < P; ++d) { sendDispls[d] = S; S += sendCounts[d]; }
 
-    CHECK_MPI(MPI_Alltoallv(recv_cols.data(), recv_counts.data(), recv_displs.data(), MPI_INT,
-                            send_cols.data(), send_counts.data(), send_displs.data(), MPI_INT,
+    // 3. Exchange the global column-index lists.
+    std::vector<int> sendColsFlat(S);
+    CHECK_MPI(MPI_Alltoallv(recvColsFlat.data(), recvCounts.data(), recvDispls.data(), MPI_INT,
+                            sendColsFlat.data(), sendCounts.data(), sendDispls.data(), MPI_INT,
                             MPI_COMM_WORLD));
 
+    // 4. Convert served global columns -> LOCAL indices into our X. This is your colsToServe.
+    std::vector<int> colsToServe(S);
+    for (int k = 0; k < S; ++k)
+        colsToServe[k] = LOCAL_INDEX(sendColsFlat[k], rank, P);
 
+    std::unordered_map<int,int> colToSlot;
+    colToSlot.reserve(2 * G);
+    for (int g = 0; g < G; ++g) colToSlot[recvColsFlat[g]] = N + g;  // ghost slots
 
+    std::vector<int> Jlocal(nz);
+    for (int k = 0; k < nz; ++k) {
+        int col = J[k];
+        Jlocal[k] = (OWNER(col, P) == rank)
+                ? LOCAL_INDEX(col, rank, P)   // local slot in [0, N)
+                : colToSlot[col];             // ghost slot in [N, N+G)
+    }
 
-    // // Pack the values others asked for, on the host: col c (we own it) -> X[(c-rank)/P]
-    // std::vector<float> send_vals(total_send);
-    // for (int t = 0; t < total_send; ++t)
-    //     send_vals[t] = X[LOCAL_INDEX(send_cols[t], rank, P)];
+    // flatRequest = destination slots in xForKernel for received ghosts.
+    std::vector<int> flatRequest(G);
+    for (int g = 0; g < G; ++g) flatRequest[g] = N + g;
 
-    // // ---- Device extended X = [ owned (N) | ghosts (total_recv) ] ----
-    // float *d_X_ext = nullptr;
-    // float *d_send = nullptr;
-    // CHECK_CUDA(cudaMalloc(&d_X_ext, (size_t)(N + total_recv) * sizeof(float)));
-    // CHECK_CUDA(cudaMemcpy(d_X_ext, X.data(), (size_t)N * sizeof(float), cudaMemcpyHostToDevice));
+    // Phase 2 part 1
+    float *d_xForKernel;                                   // N + G
+    CHECK_CUDA(cudaMalloc(&d_xForKernel, (N + G) * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_xForKernel, X.data(), N * sizeof(float), cudaMemcpyHostToDevice));
 
-    // if (total_send > 0)
-    // {
-    //     CHECK_CUDA(cudaMalloc(&d_send, (size_t)total_send * sizeof(float)));
-    //     CHECK_CUDA(cudaMemcpy(d_send, send_vals.data(),
-    //                           (size_t)total_send * sizeof(float), cudaMemcpyHostToDevice));
-    // }
+    int   *d_colsToServe, *d_flatRequest;
+    float *d_toSend, *d_xGhost;
+    CHECK_CUDA(cudaMalloc(&d_colsToServe, S * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_flatRequest, G * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&d_toSend,      S * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_xGhost,      G * sizeof(float)));
+    CHECK_CUDA(cudaMemcpy(d_colsToServe, colsToServe.data(), S*sizeof(int), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_flatRequest, flatRequest.data(), G*sizeof(int), cudaMemcpyHostToDevice));
 
-    // // CUDA-aware: device send buffer -> device ghost region, no host staging.
-    // CHECK_MPI(MPI_Alltoallv(d_send,      send_counts.data(), send_displs.data(), MPI_FLOAT,
-    //                         d_X_ext + N, recv_counts.data(), recv_displs.data(), MPI_FLOAT,
-    //                         MPI_COMM_WORLD));
+    // Phase 2 part 2
+    auto grid = [](int n){ return (n + 255) / 256; };
 
-    // Pack the values others asked for (unchanged) ...
-    std::vector<float> send_vals(total_send);
-    for (int t = 0; t < total_send; ++t)
-        send_vals[t] = X[LOCAL_INDEX(send_cols[t], rank, P)];
+    // (a) gather the values others requested, on device
+    gatherXValues<<<grid(S), 256>>>(d_toSend, d_xForKernel, d_colsToServe, S);
+    CHECK_CUDA(cudaDeviceSynchronize());          // MPI is NOT stream-ordered — sync before handing it the buffer
 
-    // Exchange actual values on the HOST — no CUDA-aware MPI needed.
-    std::vector<float> recv_vals(total_recv);
-    CHECK_MPI(MPI_Alltoallv(send_vals.data(), send_counts.data(), send_displs.data(), MPI_FLOAT,
-                            recv_vals.data(), recv_counts.data(), recv_displs.data(), MPI_FLOAT,
+    // (b) exchange GPU buffer -> GPU buffer directly (CUDA-aware MPI)
+    CHECK_MPI(MPI_Alltoallv(d_toSend, sendCounts.data(), sendDispls.data(), MPI_FLOAT,
+                            d_xGhost, recvCounts.data(), recvDispls.data(), MPI_FLOAT,
                             MPI_COMM_WORLD));
 
-    MPI_Barrier(MPI_COMM_WORLD);
+    // (c) scatter received ghosts into the kernel's X array, on device
+    scatterXValues<<<grid(G), 256>>>(d_xForKernel, d_xGhost, d_flatRequest, G);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());          // before the SpMV kernel reads d_xForKernel (if on a different stream)
 
-    // ---- Device extended X = [ owned (N) | ghosts (total_recv) ] ----
-    float *d_X_ext = nullptr;
-    CHECK_CUDA(cudaMalloc(&d_X_ext, (size_t)(N + total_recv) * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_X_ext, X.data(), (size_t)N * sizeof(float), cudaMemcpyHostToDevice));
-    if (total_recv > 0)
-        CHECK_CUDA(cudaMemcpy(d_X_ext + N, recv_vals.data(),
-                            (size_t)total_recv * sizeof(float), cudaMemcpyHostToDevice));
-
-
-
-
-    // const int COMM_WARMUP = 5;
-    // const int COMM_ITER   = 50;
-
-    // // warm up the path (first call sets up CUDA-aware staging / connections)
-    // for (int k = 0; k < COMM_WARMUP; ++k)
-    //     CHECK_MPI(MPI_Alltoallv(d_send,      send_counts.data(), send_displs.data(), MPI_FLOAT,
-    //                             d_X_ext + N, recv_counts.data(), recv_displs.data(), MPI_FLOAT,
-    //                             MPI_COMM_WORLD));
-
-    // CHECK_CUDA(cudaDeviceSynchronize());   // GPU done before we start the clock
-    // MPI_Barrier(MPI_COMM_WORLD);           // align ranks
-    // double t0 = MPI_Wtime();
-
-    // for (int k = 0; k < COMM_ITER; ++k)
-    //     CHECK_MPI(MPI_Alltoallv(d_send,      send_counts.data(), send_displs.data(), MPI_FLOAT,
-    //                             d_X_ext + N, recv_counts.data(), recv_displs.data(), MPI_FLOAT,
-    //                             MPI_COMM_WORLD));
-
-    // CHECK_CUDA(cudaDeviceSynchronize());   // ensure device-side completion
-    // double t_halo = (MPI_Wtime() - t0) / COMM_ITER;
-
-    // if (total_send > 0) CHECK_CUDA(cudaFree(d_send));
-
-    // ---- Remap columns so SpMV indexes d_X_ext directly ----
-    // owned col -> (c-rank)/P ; ghost col -> N + its slot in recv_cols
-    std::unordered_map<int,int> ghost_pos;
-    for (int t = 0; t < total_recv; ++t) ghost_pos[recv_cols[t]] = N + t;
-
-    std::vector<int> Jloc(nz);
-    for (int i = 0; i < nz; ++i)
-        Jloc[i] = (OWNER(J[i], P) == rank) ? LOCAL_INDEX(J[i], rank, P)
-                                           : ghost_pos[J[i]];
-
-    // d_X_ext is now complete; SpMV reads d_X_ext[Jloc[i]].
+    // now launch your CSR SpMV using Jlocal and d_xForKernel
 
 
 
 
 
-
-
-
-    // CHECK_MPI(MPI_Bcast(g_X.data(), g_N, MPI_FLOAT, 0, MPI_COMM_WORLD));
-
-
-
-
-
-
-    MPI_Barrier(MPI_COMM_WORLD);
 
     std::vector<int> O(M + 1);
     for (int i = 0; i < nz; ++i) O[LOCAL_INDEX(I[i], rank, P) + 1]++;
     for (int i = 1; i <= M; ++i) O[i] += O[i - 1];
 
+    MPI_Barrier(MPI_COMM_WORLD);
     // struct results caca = spmv_gpu_csr_opt_prof(O.data(), J.data(), val.data(), M, g_N, nz, NULL, g_X.data());
     // struct results caca = spmv_gpu_csr_opt_prof(O.data(), Jloc.data(), val.data(), M, N + total_recv, nz, NULL, d_X_ext);
+    struct results caca = spmv_gpu_csr_opt_prof(O.data(), Jlocal.data(), val.data(), M, N + G, nz, NULL, d_xForKernel);
 
-    float *Xh = (float *)malloc((N + total_recv) * sizeof(float));
-    cudaMemcpy(Xh, d_X_ext, N * sizeof(float), cudaMemcpyDeviceToHost);
+    // float *Xh = (float *)malloc((N + total_recv) * sizeof(float));
+    // cudaMemcpy(Xh, d_X_ext, N * sizeof(float), cudaMemcpyDeviceToHost);
 
-    CHECK_CUDA(cudaFree(d_X_ext));
+    // CHECK_CUDA(cudaFree(d_X_ext));
 
+    MPI_Barrier(MPI_COMM_WORLD);
+    // CHECK_MPI(MPI_Bcast(g_X.data(), g_N, MPI_FLOAT, 0, MPI_COMM_WORLD));
     std::ostringstream oss;
 
-    // oss << "Rank Info:\n\n";
-    // oss << "   Rank . . . . . . . . . . . . . : " << rank << "\n";
-    // oss << "   M  . . . . . . . . . . . . . . : " << M << '\n';
-    // oss << "   N  . . . . . . . . . . . . . . : " << N + total_recv << '\n';
-    // oss << "   NZ . . . . . . . . . . . . . . : " << nz << "\n\n";
-    // print_results(caca, argv[1], "csr", oss);
+    oss << "Rank Info:\n\n";
+    oss << "   Rank . . . . . . . . . . . . . : " << rank << "\n";
+    oss << "   M  . . . . . . . . . . . . . . : " << M << '\n';
+    oss << "   N  . . . . . . . . . . . . . . : " << N + G << '\n';
+    oss << "   NZ . . . . . . . . . . . . . . : " << nz << "\n\n";
+    print_results(caca, argv[1], "csr", oss);
     // oss << "Comm Results:\n\n";
     // oss << "   Time . . . . . . . . . . . . . : " << t_halo * 1e3 << "\n\n";
-    oss << "Rank=" << rank << "\n";
-    for (int i = 0; i < nz; i++) oss << Jloc[i] << " ";
-    oss << "\n";
-    for (int i = 0; i < N + total_recv; i++) oss << Xh[i] << " ";
-    oss << "\n";
-    for (int i = 0; i < g_N; i++) oss << g_X[i] << " ";
-    oss << "\n";
+    // oss << "Rank=" << rank << "\n";
+    // for (int i = 0; i < nz; i++) oss << Jloc[i] << " ";
+    // oss << "\n";
+    // for (int i = 0; i < N + total_recv; i++) oss << Xh[i] << " ";
+    // oss << "\n";
+    // for (int i = 0; i < g_N; i++) oss << g_X[i] << " ";
+    // oss << "\n";
 
-    free(Xh);
+    // free(Xh);
+
+    // oss << "[" << rank << "] ";
+    // for (int i = 0; i < 20; i++) oss << test[i] << " ";
 
     MPI_Barrier(MPI_COMM_WORLD);
     std::cout << oss.str() << std::endl;
