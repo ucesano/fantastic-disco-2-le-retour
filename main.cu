@@ -110,6 +110,29 @@ __global__ void scatterXValues(float *xForKernel, float *xGhost, int *flatReques
     if (k < n) xForKernel[flatRequest[k]] = xGhost[k];
 }
 
+// Average per-iteration comm time (ms) for THIS rank. CUDA-aware MPI_Alltoallv only.
+double halo_comm_prof(float *d_toSend, float *d_xGhost,
+                      const int *sendCounts, const int *sendDispls,
+                      const int *recvCounts, const int *recvDispls,
+                      MPI_Comm comm)
+{
+    // Warmup — same buffers, results discarded. First call is much slower.
+    for (int k = 0; k < WARMUP; ++k)
+        MPI_Alltoallv(d_toSend, sendCounts, sendDispls, MPI_FLOAT,
+                      d_xGhost, recvCounts, recvDispls, MPI_FLOAT, comm);
+    MPI_Barrier(comm);
+
+    double sum = 0.0;
+    for (int k = 0; k < ITERATION; ++k) {
+        MPI_Barrier(comm);                 // align entry: time the collective, not skew
+        double t0 = MPI_Wtime();
+        MPI_Alltoallv(d_toSend, sendCounts, sendDispls, MPI_FLOAT,
+                      d_xGhost, recvCounts, recvDispls, MPI_FLOAT, comm);
+        double t1 = MPI_Wtime();
+        sum += (t1 - t0);
+    }
+    return (sum / ITERATION) * 1e3;        // ms
+}
 
 int main(int argc, char ** argv)
 {
@@ -261,9 +284,9 @@ int main(int argc, char ** argv)
 
 
 
+    fprintf(stderr, "[%d] dev=%d of %d\n", rank, local_dev, dev_count);
     #if defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
-    if (rank == 0 && !MPIX_Query_cuda_support())
-        fprintf(stderr, "WARNING: MPI is NOT CUDA-aware at runtime\n");
+    if (rank==0) fprintf(stderr, "cuda-aware runtime: %d\n", MPIX_Query_cuda_support());
     #endif
 
 
@@ -343,6 +366,42 @@ int main(int argc, char ** argv)
     // (a) gather the values others requested, on device
     gatherXValues<<<grid(S), 256>>>(d_toSend, d_xForKernel, d_colsToServe, S);
     CHECK_CUDA(cudaDeviceSynchronize());          // MPI is NOT stream-ordered — sync before handing it the buffer
+
+    double comm_ms = halo_comm_prof(d_toSend, d_xGhost,
+                                sendCounts.data(), sendDispls.data(),
+                                recvCounts.data(), recvDispls.data(),
+                                MPI_COMM_WORLD);
+
+    double comm_max = 0.0, comm_sum = 0.0;
+    MPI_Reduce(&comm_ms, &comm_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&comm_ms, &comm_sum, 1, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    if (rank == 0)
+        fprintf(stderr, "halo comm: max=%.4f ms  avg=%.4f ms\n",
+                comm_max, comm_sum / P);
+    long sBytes = (long)S * sizeof(float);
+    long rBytes = (long)G * sizeof(float);
+    fprintf(stderr, "[%d] S=%d G=%d  send=%.2f MB recv=%.2f MB  eff=%.1f MB/s\n",
+            rank, S, G, sBytes/1e6, rBytes/1e6,
+            rBytes / (comm_ms * 1e-3) / 1e6);
+
+    // A) device path — what you have
+    MPI_Barrier(MPI_COMM_WORLD); double td0 = MPI_Wtime();
+    MPI_Alltoallv(d_toSend, sendCounts.data(), sendDispls.data(), MPI_FLOAT,
+                d_xGhost, recvCounts.data(), recvDispls.data(), MPI_FLOAT, MPI_COMM_WORLD);
+    double td1 = MPI_Wtime();
+
+    // B) host-staged path — copies included in the timed region
+    std::vector<float> h_send(S), h_ghost(G);
+    MPI_Barrier(MPI_COMM_WORLD); double th0 = MPI_Wtime();
+    cudaMemcpy(h_send.data(), d_toSend, S*sizeof(float), cudaMemcpyDeviceToHost);
+    MPI_Alltoallv(h_send.data(),  sendCounts.data(), sendDispls.data(), MPI_FLOAT,
+                h_ghost.data(), recvCounts.data(), recvDispls.data(), MPI_FLOAT, MPI_COMM_WORLD);
+    cudaMemcpy(d_xGhost, h_ghost.data(), G*sizeof(float), cudaMemcpyHostToDevice);
+    double th1 = MPI_Wtime();
+
+    fprintf(stderr, "[%d] device=%.3f ms  hoststaged=%.3f ms\n",
+            rank, (td1-td0)*1e3, (th1-th0)*1e3);
+
 
     // (b) exchange GPU buffer -> GPU buffer directly (CUDA-aware MPI)
     CHECK_MPI(MPI_Alltoallv(d_toSend, sendCounts.data(), sendDispls.data(), MPI_FLOAT,

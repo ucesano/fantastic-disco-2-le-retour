@@ -95,7 +95,7 @@ struct results spmv_gpu_csr_opt_prof(const int *__restrict__ O,
     }
 
     res.exec_time = sum / ITERATION;
-    res.gflops = (2.0f * nz - M) / (res.exec_time * 1e6f);
+    res.gflops = (2.0f * nz) / (res.exec_time * 1e6f);
 
     cudaMemcpy(Ybis, dY, M * sizeof(float), cudaMemcpyDeviceToHost);
 
@@ -103,10 +103,7 @@ struct results spmv_gpu_csr_opt_prof(const int *__restrict__ O,
     cudaFree(dJ);
     cudaFree(dval);
     cudaFree(dY);
-    // Do NOT free X — the caller owns d_X_ext.
 
-    // CPU reference: stage the device extended vector to host, run with the same
-    // Jloc (J here) against the same [owned | ghosts] layout.
     float *Xh = (float *)malloc(N * sizeof(float));
     cudaMemcpy(Xh, X, N * sizeof(float), cudaMemcpyDeviceToHost);
 
