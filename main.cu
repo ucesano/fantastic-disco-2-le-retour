@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <iomanip>
+#include <numeric>
 #include <sstream>
 #include <fstream>
 #include <vector>
@@ -66,8 +67,47 @@ extern "C" {
 #pragma region partitioning_helpers
 
 static inline int owner(const int i, const int P) { return i % P; }
+
 static inline int global_to_local(const int i, const int P) { return i / P; }
+
 static inline int local_to_global(const int l, const int p, const int P) { return l * P + p; }
+
+void sort_by_rank(std::vector<int>& I, std::vector<int>& J, std::vector<float>& val, std::vector<float>& X, int P)
+{
+    const std::size_t nnz = I.size();
+    if (J.size() != nnz || val.size() != nnz) {
+        std::cerr << "[sort_coo_by_rank] SIZE MISMATCH\n";
+        return;
+    }
+
+    // 1. perm = [0, 1, ..., nnz-1]
+    std::vector<std::size_t> perm(nnz);
+    std::iota(perm.begin(), perm.end(), 0);
+
+    // 2. order indices by owning rank; stable keeps rows ascending within a rank
+    std::stable_sort(perm.begin(), perm.end(),
+        [&](std::size_t a, std::size_t b) {
+            return owner(I[a], P) < owner(I[b], P);
+        });
+
+    // 3. apply the one permutation to all three arrays
+    std::vector<int>   I2(nnz);
+    std::vector<int>   J2(nnz);
+    std::vector<float> val2(nnz);
+    std::vector<float> X2(nnz);
+
+    for (std::size_t k = 0; k < nnz; ++k) {
+        I2[k]   = I[perm[k]];
+        J2[k]   = J[perm[k]];
+        val2[k] = val[perm[k]];
+        X2[k]   = X2[perm[k]];
+    }
+
+    I   = std::move(I2);
+    J   = std::move(J2);
+    val = std::move(val2);
+    X   = std::move(X2);
+}
 
 #pragma endregion partitioning_helpers
 
@@ -142,14 +182,14 @@ void print_coo_local(const std::vector<int>& I,
 
     std::cout << "owner = [";
     for (std::size_t k = 0; k < nnz; ++k) {
-        std::cout << I[k] % P;          // owner (should all == rank)
+        std::cout << owner(I[k], P);          // owner (should all == rank)
         if (k + 1 < nnz) std::cout << ", ";
     }
     std::cout << "]\n";
 
     std::cout << "local = [";
     for (std::size_t k = 0; k < nnz; ++k) {
-        std::cout << I[k] / P;          // local row
+        std::cout << global_to_local(I[k], P);          // local row
         if (k + 1 < nnz) std::cout << ", ";
     }
     std::cout << "]\n";
@@ -297,6 +337,15 @@ int main(int argc, char ** argv)
     CHECK_MPI(MPI_Bcast(&g_nz, 1, MPI_INT, 0, MPI_COMM_WORLD));
 
     #pragma endregion loading_file
+
+    #pragma region partitionning_matrix
+
+    if (p == 0)
+    {
+        sort_by_rank(I, J, val, X, P);
+    }
+
+    #pragma endregion partitionning_matrix
 
     if (p == 0) print_coo_local(I, J, val, P, p);
 
