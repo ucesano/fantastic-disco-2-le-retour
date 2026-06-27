@@ -1,6 +1,7 @@
 #pragma region includes
 
 #include <iostream>
+#include <iomanip>
 #include <sstream>
 #include <fstream>
 #include <vector>
@@ -118,6 +119,57 @@ inline void display_card_informations(const int devCount, std::ostream& os = std
 
 #pragma endregion helpers
 
+#pragma region debug
+
+void print_coo_local(const std::vector<int>& I,
+                     const std::vector<int>& J,
+                     const std::vector<float>& val,
+                     int P, int rank = -1) {
+    const std::size_t nnz = I.size();
+    if (J.size() != nnz || val.size() != nnz) {
+        std::cerr << "[print_coo_local] SIZE MISMATCH\n";
+        return;
+    }
+
+    std::cout << "rank " << rank << ": " << nnz << " local nonzeros (P=" << P << ")\n";
+
+    std::cout << "I     = [";
+    for (std::size_t k = 0; k < nnz; ++k) {
+        std::cout << I[k];
+        if (k + 1 < nnz) std::cout << ", ";
+    }
+    std::cout << "]\n";
+
+    std::cout << "owner = [";
+    for (std::size_t k = 0; k < nnz; ++k) {
+        std::cout << I[k] % P;          // owner (should all == rank)
+        if (k + 1 < nnz) std::cout << ", ";
+    }
+    std::cout << "]\n";
+
+    std::cout << "local = [";
+    for (std::size_t k = 0; k < nnz; ++k) {
+        std::cout << I[k] / P;          // local row
+        if (k + 1 < nnz) std::cout << ", ";
+    }
+    std::cout << "]\n";
+
+    std::cout << "J     = [";
+    for (std::size_t k = 0; k < nnz; ++k) {
+        std::cout << J[k];
+        if (k + 1 < nnz) std::cout << ", ";
+    }
+    std::cout << "]\n";
+
+    std::cout << "val   = [";
+    for (std::size_t k = 0; k < nnz; ++k) {
+        std::cout << val[k];
+        if (k + 1 < nnz) std::cout << ", ";
+    }
+    std::cout << "]\n";
+}
+
+#pragma endregion debug
 
 int main(int argc, char ** argv)
 {
@@ -207,9 +259,9 @@ int main(int argc, char ** argv)
             --x;
             --y;
 
-            f_I.push_back(x);
-            f_J.push_back(y);
-            f_val.push_back(z);
+            I.push_back(x);
+            J.push_back(y);
+            val.push_back(z);
 
             if (mm_is_symmetric(matcode))
             {
@@ -228,14 +280,15 @@ int main(int argc, char ** argv)
         g_nz = I.size();
 
         mm_sort_coo(I.data(), J.data(), val.data(), g_nz);
-
-
-        CHECK_MPI(MPI_Bcast(g_M, sizeof(int), MPI_INT, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Bcast(g_N, sizeof(int), MPI_INT, 0, MPI_COMM_WORLD));
-        CHECK_MPI(MPI_Bcast(g_nz, sizeof(int), MPI_INT, 0, MPI_COMM_WORLD));
     }
 
+    CHECK_MPI(MPI_Bcast(&g_M, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    CHECK_MPI(MPI_Bcast(&g_N, 1, MPI_INT, 0, MPI_COMM_WORLD));
+    CHECK_MPI(MPI_Bcast(&g_nz, 1, MPI_INT, 0, MPI_COMM_WORLD));
+
     #pragma endregion loading_file
+
+    if (p == 0) print_coo_local(I, J, val, P, p);
 
     #pragma region cleaning_up
 
