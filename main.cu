@@ -218,11 +218,18 @@ int main(int argc, char ** argv)
     int g_N  = 0;
     int g_nz = 0;
 
-    #pragma region loading_file
+    int M  = 0;
+    int N  = 0;
+    int nz = 0;
 
     std::vector<int> I;
     std::vector<int> J;
+
     std::vector<float> val;
+    std::vector<float> X;
+    std::vector<float> Y;
+
+    #pragma region loading_file
 
     if (p == 0)
     {
@@ -280,6 +287,9 @@ int main(int argc, char ** argv)
         g_nz = I.size();
 
         mm_sort_coo(I.data(), J.data(), val.data(), g_nz);
+
+        X.reserve(g_N);
+        for (int i = 0; i < g_N; i++) X[i] =  static_cast<float>(genrand_real1() * 100);
     }
 
     CHECK_MPI(MPI_Bcast(&g_M, 1, MPI_INT, 0, MPI_COMM_WORLD));
