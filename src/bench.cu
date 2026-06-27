@@ -125,8 +125,8 @@ struct results spmv_gpu_csr_opt_prof(const int *__restrict__ O,
 
         if (rel_err > tol_rel && abs_err > tol_abs)
         {
-            fprintf(stderr, "FAIL row %d : cpu=%.8f gpu=%.8f rel_err=%.2e\n",
-                    i, Y[i], Ybis[i], rel_err);
+            // fprintf(stderr, "FAIL row %d : cpu=%.8f gpu=%.8f rel_err=%.2e\n",
+            //         i, Y[i], Ybis[i], rel_err);
             res.is_correct = 0;
         }
     }
