@@ -35,6 +35,7 @@ extern "C" {
 #endif
 
 #include "include/bench.cuh"
+#include "include/spmv_gpu.cuh"
 
 #pragma endregion includes
 
@@ -528,6 +529,8 @@ int main(int argc, char ** argv)
 
     #pragma endregion init
 
+    #pragma region variables
+
     int g_M  = 0;
     int g_N  = 0;
     int g_nz = 0;
@@ -551,6 +554,8 @@ int main(int argc, char ** argv)
     float * d_val = nullptr;
     float * d_X   = nullptr;
     float * d_Y   = nullptr;
+
+    #pragma endregion variables
 
     #pragma region loading_file
 
@@ -593,7 +598,7 @@ int main(int argc, char ** argv)
             J.push_back(y);
             val.push_back(z);
 
-            if (mm_is_symmetric(matcode))
+            if (mm_is_symmetric(matcode) && x != y)
             {
                 I.push_back(y);
                 J.push_back(x);
@@ -613,6 +618,7 @@ int main(int argc, char ** argv)
 
         X.resize(g_N);
         for (int i = 0; i < g_N; i++) X[i] =  static_cast<float>(genrand_real1());
+        // for (int i = 0; i < g_N; i++) X[i] =  static_cast<float>(i + 1);
     }
 
     CHECK_MPI(MPI_Bcast(&g_M, 1, MPI_INT, 0, MPI_COMM_WORLD));
@@ -701,17 +707,67 @@ int main(int argc, char ** argv)
 
     int n_ghost = exchange_ghosts(d_J, d_X, nz, owned_N, P, p);
 
-    debug_print_device_csr(d_O, d_J, d_val, d_X, M, nz, owned_N + n_ghost, P, p);
-    MPI_Barrier(MPI_COMM_WORLD);
+    // debug_print_device_csr(d_O, d_J, d_val, d_X, M, nz, owned_N + n_ghost, P, p);
+    // MPI_Barrier(MPI_COMM_WORLD);
 
     #pragma endregion halo_exchange
 
+    #pragma region local_spmv
+
+    cudaMalloc(&d_Y, M * sizeof(float));
+    cudaMemset(d_Y, 0, M * sizeof(float));
+
+    threads = 128;                       // 4 warps/block
+    int warps_needed = M;                    // one warp per local row
+    blocks = (warps_needed * 32 + threads - 1) / threads;
+    size_t shmem = threads * sizeof(float);
+
+    spmv_gpu_csr_opt<<<blocks, threads, shmem>>>(d_O, d_J, d_val, M, d_X, d_Y);
+    cudaDeviceSynchronize();
+
+    #pragma endregion local_spmv
+
+    #pragma region y_gather
+
+    std::vector<int> ycount(P, 0), ydispl(P, 0);
+    if (p == 0) {
+        for (int r = 0; r < P; ++r) ycount[r] = (g_M - r + P - 1) / P;   // rows per rank
+        for (int r = 1; r < P; ++r) ydispl[r] = ydispl[r-1] + ycount[r-1];
+    }
+
+    float* d_Yfull = nullptr;
+    if (p == 0) cudaMalloc(&d_Yfull, g_M * sizeof(float));
+
+    MPI_Gatherv(d_Y,     M, MPI_FLOAT,
+                d_Yfull, ycount.data(), ydispl.data(), MPI_FLOAT,
+                0, MPI_COMM_WORLD);
+
+    if (p == 0) {
+        std::vector<float> hYblock(g_M), hY(g_M);
+        cudaMemcpy(hYblock.data(), d_Yfull, g_M * sizeof(float), cudaMemcpyDeviceToHost);
+
+        for (int r = 0; r < P; ++r)
+            for (int l = 0; l < ycount[r]; ++l)
+                hY[l * P + r] = hYblock[ydispl[r] + l];   // block pos -> global row
+        // hY is now y in global row order
+
+        std::ostringstream oss;
+        for (int i = 0; i < g_M; ++i) oss << hY[i] << "\n";
+        std::cout<< oss.str();
+    }
+
+    #pragma endregion y_gather
+
     #pragma region cleaning_up
 
+    CHECK_CUDA(cudaFree(d_O));
     CHECK_CUDA(cudaFree(d_I));
     CHECK_CUDA(cudaFree(d_J));
     CHECK_CUDA(cudaFree(d_val));
     CHECK_CUDA(cudaFree(d_X));
+    CHECK_CUDA(cudaFree(d_Y));
+
+    if (p == 0) CHECK_CUDA(cudaFree(d_Yfull));
 
     CHECK_MPI(MPI_Finalize());
 
