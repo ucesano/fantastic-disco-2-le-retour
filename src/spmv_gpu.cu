@@ -37,6 +37,6 @@ void spmv_gpu_csr_opt(const int   *__restrict__ O,
     if (lane < 2) vals[threadIdx.x] += vals[threadIdx.x + 2]; __syncwarp();
     if (lane < 1) vals[threadIdx.x] += vals[threadIdx.x + 1]; __syncwarp();
 
-    if (lane == 0)
+    if (lane == 0 && row < M)
         Y[row] = vals[threadIdx.x];
 }
