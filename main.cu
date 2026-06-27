@@ -6,6 +6,7 @@
 #include <sstream>
 #include <fstream>
 #include <vector>
+#include <set>
 #include <unordered_set>
 #include <unordered_map>
 #include <algorithm>
@@ -157,11 +158,6 @@ void scatter_in_place(int g_nz, int g_N, int P, int rank, int*& d_I, int*& d_J, 
     d_I = r_I;  d_J = r_J;  d_val = r_val;  d_X = r_X;
 }
 
-
-#pragma endregion partitioning_helpers
-
-#pragma region communication_helpers
-
 __global__ void count_per_row(const int* d_I, int nz, int P, int* d_O)
 {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
@@ -171,6 +167,126 @@ __global__ void count_per_row(const int* d_I, int nz, int P, int* d_O)
         int local_row = d_I[k] / P;
         atomicAdd(&d_O[local_row + 1], 1);
     }
+}
+
+
+#pragma endregion partitioning_helpers
+
+#pragma region communication_helpers
+
+__global__ void gather_owned(const float* d_X, const int* d_in_cols, float* d_out_vals, int n_incoming, int P)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t < n_incoming)
+        d_out_vals[t] = d_X[d_in_cols[t] / P];   // owned => j/P
+}
+
+int exchange_ghosts(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
+{
+    // 1. columns to host
+    std::vector<int> hJ(nz);
+    cudaMemcpy(hJ.data(), d_J, nz * sizeof(int), cudaMemcpyDeviceToHost);
+
+    // 2. collect ghost columns (no set): push all remote cols, then sort+unique
+    std::vector<int> req_cols;
+    req_cols.reserve(nz);
+    for (int k = 0; k < nz; ++k)
+    {
+        int j = hJ[k];
+        if (j % P != rank) req_cols.push_back(j);
+    }
+    std::sort(req_cols.begin(), req_cols.end());
+    req_cols.erase(std::unique(req_cols.begin(), req_cols.end()), req_cols.end());
+
+    // 3. build per-owner sendcounts from the deduped, sorted list.
+    //    req_cols is globally sorted; group by owner = j % P.
+    //    NOTE: sorting by value does NOT group by owner, so count per owner explicitly
+    //    and re-bucket into owner-contiguous order for Alltoallv.
+    std::vector<int> sendcounts(P, 0), sdispls(P, 0);
+    for (int p = 0; p < (int)req_cols.size(); ++p) sendcounts[req_cols[p] % P]++;
+    for (int r = 1; r < P; ++r) sdispls[r] = sdispls[r-1] + sendcounts[r-1];
+
+    int n_ghost = (int)req_cols.size();
+
+    // re-bucket req_cols into owner-contiguous order; remember each column's
+    // final slot so we can remap J without a map.
+    std::vector<int> req_by_owner(n_ghost);
+    std::vector<int> slot_of_sorted(n_ghost);   // slot in extended x, by sorted pos
+    {
+        std::vector<int> cursor = sdispls;
+        for (int p = 0; p < n_ghost; ++p) {
+            int j = req_cols[p];
+            int dst = cursor[j % P]++;           // position in owner-grouped layout
+            req_by_owner[dst] = j;
+            slot_of_sorted[p] = owned_X + dst;   // appended slot = owned_X + dst
+        }
+    }
+
+    // 4. tell each owner how many columns we want
+    std::vector<int> recvcounts(P, 0), rdispls(P, 0);
+    MPI_Alltoall(sendcounts.data(), 1, MPI_INT,
+                 recvcounts.data(), 1, MPI_INT, MPI_COMM_WORLD);
+    for (int r = 1; r < P; ++r) rdispls[r] = rdispls[r-1] + recvcounts[r-1];
+    int n_incoming = rdispls[P-1] + recvcounts[P-1];
+
+    // 5. exchange column lists (owner-grouped) on host
+    std::vector<int> in_cols(n_incoming);
+    MPI_Alltoallv(req_by_owner.data(), sendcounts.data(), sdispls.data(), MPI_INT,
+                  in_cols.data(),      recvcounts.data(), rdispls.data(), MPI_INT,
+                  MPI_COMM_WORLD);
+
+    // 6. gather requested owned values on device
+    int   *d_in_cols  = nullptr;
+    float *d_out_vals = nullptr;
+    cudaMalloc(&d_in_cols,  (n_incoming ? n_incoming : 1) * sizeof(int));
+    cudaMalloc(&d_out_vals, (n_incoming ? n_incoming : 1) * sizeof(float));
+    if (n_incoming > 0) {
+        cudaMemcpy(d_in_cols, in_cols.data(), n_incoming * sizeof(int),
+                   cudaMemcpyHostToDevice);
+        int threads = 256, blocks = (n_incoming + threads - 1) / threads;
+        gather_owned<<<blocks, threads>>>(d_X, d_in_cols, d_out_vals, n_incoming, P);
+    }
+    cudaDeviceSynchronize();
+
+    // 7. value exchange with device pointers (CUDA-aware MPI); counts swap roles
+    float* d_ghost_vals = nullptr;
+    cudaMalloc(&d_ghost_vals, (n_ghost ? n_ghost : 1) * sizeof(float));
+    MPI_Alltoallv(d_out_vals,   recvcounts.data(), rdispls.data(), MPI_FLOAT,
+                  d_ghost_vals, sendcounts.data(), sdispls.data(), MPI_FLOAT, MPI_COMM_WORLD);
+
+    // 8. build extended d_X = [owned ; ghosts(owner-grouped)] on device
+    float* d_Xext = nullptr;
+    cudaMalloc(&d_Xext, (owned_X + n_ghost) * sizeof(float));
+    cudaMemcpy(d_Xext, d_X, owned_X * sizeof(float), cudaMemcpyDeviceToDevice);
+    if (n_ghost > 0)
+        cudaMemcpy(d_Xext + owned_X, d_ghost_vals, n_ghost * sizeof(float), cudaMemcpyDeviceToDevice);
+
+    cudaFree(d_X);
+    d_X = d_Xext;
+
+    // 9. remap J. For a ghost column j, find its position in the sorted req_cols
+    //    (binary search), then look up its slot. req_cols is sorted by value.
+    for (int k = 0; k < nz; ++k) {
+        int j = hJ[k];
+        if (j % P == rank) {
+            hJ[k] = j / P;                       // owned -> local slot
+        } else {
+            int lo = 0, hi = n_ghost - 1, pos = -1;
+            while (lo <= hi) {                   // manual binary search on req_cols
+                int mid = (lo + hi) >> 1;
+                if (req_cols[mid] == j) { pos = mid; break; }
+                else if (req_cols[mid] < j) lo = mid + 1;
+                else hi = mid - 1;
+            }
+            hJ[k] = slot_of_sorted[pos];         // appended slot for this ghost
+        }
+    }
+    cudaMemcpy(d_J, hJ.data(), nz * sizeof(int), cudaMemcpyHostToDevice);
+
+    cudaFree(d_in_cols);
+    cudaFree(d_out_vals);
+    cudaFree(d_ghost_vals);
+    return n_ghost;
 }
 
 #pragma endregion communication_helpers
@@ -362,6 +478,7 @@ void debug_print_device_csr(const int* d_O, const int* d_J,
 }
 
 #pragma endregion debug
+
 
 int main(int argc, char ** argv)
 {
@@ -564,6 +681,7 @@ int main(int argc, char ** argv)
     #pragma endregion matrix_scatter
 
     #pragma region computing_csr
+
     int* d_O = nullptr;
     cudaMalloc(&d_O, (M + 1) * sizeof(int));
     cudaMemset(d_O, 0, (M + 1) * sizeof(int));
@@ -574,10 +692,19 @@ int main(int argc, char ** argv)
     thrust::device_ptr<int> t(d_O);
     thrust::inclusive_scan(t, t + (M + 1), t);
 
-    debug_print_device_csr(d_O, d_J, d_val, d_X, M, nz, owned_N, P, p);
+    #pragma endregion computing_csr
+
+    // debug_print_device_csr(d_O, d_J, d_val, d_X, M, nz, owned_N, P, p);
+    // MPI_Barrier(MPI_COMM_WORLD);
+
+    #pragma region halo_exchange
+
+    int n_ghost = exchange_ghosts(d_J, d_X, nz, owned_N, P, p);
+
+    debug_print_device_csr(d_O, d_J, d_val, d_X, M, nz, owned_N + n_ghost, P, p);
     MPI_Barrier(MPI_COMM_WORLD);
 
-    #pragma endregion computing_csr
+    #pragma endregion halo_exchange
 
     #pragma region cleaning_up
 
