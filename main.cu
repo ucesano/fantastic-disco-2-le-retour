@@ -125,8 +125,8 @@ int main(int argc, char ** argv)
 
     CHECK_MPI(MPI_Init(&argc, &argv));
 
-    int rank, P;
-    CHECK_MPI(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+    int p, P;
+    CHECK_MPI(MPI_Comm_rank(MPI_COMM_WORLD, &p));
     CHECK_MPI(MPI_Comm_size(MPI_COMM_WORLD, &P));
 
     // Abort if only 1 task.
@@ -140,7 +140,7 @@ int main(int argc, char ** argv)
     int dev_count = 0;
     CHECK_CUDA(cudaGetDeviceCount(&dev_count));
 
-    // std::cout << "rank=" << rank << "\n";
+    // std::cout << "p=" << p << "\n";
     // display_card_informations(dev_count);
 
     if (dev_count == 0)
@@ -149,18 +149,93 @@ int main(int argc, char ** argv)
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
 
-    // Affecting CUDA capable device to rank.
-    int local_dev = rank % dev_count;
+    // Affecting CUDA capable device to p.
+    int local_dev = p % dev_count;
     CHECK_CUDA(cudaSetDevice(local_dev));
 
     // Executable must have a MTX file as arg.
     if (argc < 2)
     {
-        if (rank == 0) std::cerr << "Usage: " << argv[0] << " matrix.mtx\n";
+        if (p == 0) std::cerr << "Usage: " << argv[0] << " matrix.mtx\n";
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
 
     #pragma endregion init
+
+    int g_M  = 0;
+    int g_N  = 0;
+    int g_nz = 0;
+
+    #pragma region loading_file
+
+    std::vector<int> I;
+    std::vector<int> J;
+    std::vector<float> val;
+
+    if (p == 0)
+    {
+        FILE *f = NULL;
+        if ((f = fopen(argv[1], "r")) == NULL)
+        {
+            std::cerr << "Could not open MTX file." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+
+        MM_typecode matcode;
+
+        if (mm_read_banner(f, &matcode) != 0)
+        {
+            std::cerr << "Could not process Matrix Market banner." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+
+        if (mm_read_mtx_crd_size(f, &g_M, &g_N, &g_nz) != 0)
+        {
+            std::cerr << "Unsupported Matrix." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+
+        for (int i = 0; i < g_nz; ++i)
+        {
+            int x;
+            int y;
+            float z;
+
+            fscanf(f, "%d %d %g\n", &x, &y, &z);
+
+            // Going from 1-based to 0-based.
+            --x;
+            --y;
+
+            f_I.push_back(x);
+            f_J.push_back(y);
+            f_val.push_back(z);
+
+            if (mm_is_symmetric(matcode))
+            {
+                I.push_back(y);
+                J.push_back(x);
+                val.push_back(z);
+            }
+        }
+
+        if (!(I.size() == J.size() && J.size() == val.size()))
+        {
+            std::cerr << "Ill-formed matrix." << std::endl;
+            MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+        }
+
+        g_nz = I.size();
+
+        mm_sort_coo(I.data(), J.data(), val.data(), g_nz);
+
+
+        CHECK_MPI(MPI_Bcast(g_M, sizeof(int), MPI_INT, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Bcast(g_N, sizeof(int), MPI_INT, 0, MPI_COMM_WORLD));
+        CHECK_MPI(MPI_Bcast(g_nz, sizeof(int), MPI_INT, 0, MPI_COMM_WORLD));
+    }
+
+    #pragma endregion loading_file
 
     #pragma region cleaning_up
 
@@ -168,5 +243,5 @@ int main(int argc, char ** argv)
 
     #pragma endregion cleaning_up
 
-    return 0;
+    return EXIT_SUCCESS;
 }
