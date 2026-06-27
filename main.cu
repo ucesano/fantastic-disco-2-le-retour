@@ -18,6 +18,9 @@
 #include <mpi-ext.h>
 #include <cuda_runtime.h>
 
+#include <thrust/scan.h>
+#include <thrust/device_ptr.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -157,6 +160,21 @@ void scatter_in_place(int g_nz, int g_N, int P, int rank, int*& d_I, int*& d_J, 
 
 #pragma endregion partitioning_helpers
 
+#pragma region communication_helpers
+
+__global__ void count_per_row(const int* d_I, int nz, int P, int* d_O)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (k < nz)
+    {
+        int local_row = d_I[k] / P;
+        atomicAdd(&d_O[local_row + 1], 1);
+    }
+}
+
+#pragma endregion communication_helpers
+
 #pragma region info_helpers
 
 inline void print_device_properties(const cudaDeviceProp& dev, std::ostream& os)
@@ -293,6 +311,52 @@ void debug_print_device(const int* d_I, const int* d_J,
     std::cout << "X   = [";
     for (int i = 0; i < N; ++i) { std::cout << hX[i]; if (i+1 < N) std::cout << ", "; }
     std::cout << "]\n";
+
+    std::cout.flush();
+}
+
+void debug_print_device_csr(const int* d_O, const int* d_J,
+                            const float* d_val, const float* d_X,
+                            int M, int nz, int N, int P, int rank)
+{
+    std::vector<int>   hO(M + 1), hJ(nz);
+    std::vector<float> hval(nz), hX(N);
+
+    cudaMemcpy(hO.data(),   d_O,   (M + 1) * sizeof(int),   cudaMemcpyDeviceToHost);
+    cudaMemcpy(hJ.data(),   d_J,   nz * sizeof(int),        cudaMemcpyDeviceToHost);
+    cudaMemcpy(hval.data(), d_val, nz * sizeof(float),      cudaMemcpyDeviceToHost);
+    cudaMemcpy(hX.data(),   d_X,   N  * sizeof(float),      cudaMemcpyDeviceToHost);
+
+    std::cout << "=== rank " << rank << " (M=" << M << ", nz=" << nz
+              << ", N=" << N << ") ===\n";
+
+    std::cout << "O   = [";
+    for (int r = 0; r <= M; ++r) { std::cout << hO[r]; if (r < M) std::cout << ", "; }
+    std::cout << "]\n";
+
+    std::cout << "J   = [";
+    for (int k = 0; k < nz; ++k) { std::cout << hJ[k]; if (k+1 < nz) std::cout << ", "; }
+    std::cout << "]\n";
+
+    std::cout << "val = [";
+    for (int k = 0; k < nz; ++k) { std::cout << hval[k]; if (k+1 < nz) std::cout << ", "; }
+    std::cout << "]\n";
+
+    std::cout << "X   = [";
+    for (int i = 0; i < N; ++i) { std::cout << hX[i]; if (i+1 < N) std::cout << ", "; }
+    std::cout << "]\n";
+
+    std::cout << "rows:\n";
+    for (int r = 0; r < M; ++r) {
+        int g_row = r * P + rank;                 // local_to_global
+        std::cout << "  l_row " << r << " (g_row " << g_row << "): ";
+        if (hO[r] == hO[r + 1]) std::cout << "(empty)";
+        for (int k = hO[r]; k < hO[r + 1]; ++k) {
+            std::cout << "(" << hJ[k] << ", " << hval[k] << ")";
+            if (k + 1 < hO[r + 1]) std::cout << " ";
+        }
+        std::cout << "\n";
+    }
 
     std::cout.flush();
 }
@@ -440,7 +504,7 @@ int main(int argc, char ** argv)
 
     #pragma endregion loading_file
 
-    if (p == 0) print_coo_local(I, J, val, X, P, p);
+    // if (p == 0) print_coo_local(I, J, val, X, P, p);
 
     #pragma region partitionning_matrix
 
@@ -473,7 +537,7 @@ int main(int argc, char ** argv)
 
     #pragma endregion partitionning_matrix
 
-    if (p == 0) print_coo_local(I, J, val, X, P, p);
+    // if (p == 0) print_coo_local(I, J, val, X, P, p);
 
     #pragma region matrix_scatter
 
@@ -494,12 +558,26 @@ int main(int argc, char ** argv)
 
     scatter_in_place(g_nz, g_N, P, p, d_I, d_J, d_val, d_X, nz, owned_N);
 
-    debug_print_device(d_I, d_J, d_val, d_X, nz, owned_N, p);
-    MPI_Barrier(MPI_COMM_WORLD);
+    // debug_print_device(d_I, d_J, d_val, d_X, nz, owned_N, p);
+    // MPI_Barrier(MPI_COMM_WORLD);
 
     #pragma endregion matrix_scatter
 
-    // if (p == 0) print_coo_local(I, J, val, P, p);
+    #pragma region computing_csr
+    int* d_O = nullptr;
+    cudaMalloc(&d_O, (M + 1) * sizeof(int));
+    cudaMemset(d_O, 0, (M + 1) * sizeof(int));
+
+    int threads = 256, blocks = (nz + threads - 1) / threads;
+    count_per_row<<<blocks, threads>>>(d_I, nz, P, d_O);
+
+    thrust::device_ptr<int> t(d_O);
+    thrust::inclusive_scan(t, t + (M + 1), t);
+
+    debug_print_device_csr(d_O, d_J, d_val, d_X, M, nz, owned_N, P, p);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    #pragma endregion computing_csr
 
     #pragma region cleaning_up
 
