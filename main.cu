@@ -68,7 +68,7 @@ extern "C" {
         }                                                 \
     } while (0)
 
-// Lightweight CUDA-event timer for accurate device-side kernel timing.
+
 struct GpuTimer
 {
     cudaEvent_t a, b;
@@ -84,10 +84,6 @@ struct GpuTimer
     }
 };
 
-// Warm up the MPI subsystem before timing. The first collective in a program
-// pays one-time costs (connection setup, buffer pools, CUDA-aware/RDMA path
-// init) that would otherwise be charged to whatever phase runs first. A few
-// small dummy Allreduce + Barrier rounds prime those paths.
 static void mpi_warmup(int reps)
 {
     double scratch = 1.0, out = 0.0;
@@ -153,7 +149,6 @@ void pack_x_by_rank(std::vector<float>& X, int P)
 
 void scatter_in_place(int g_nz, int g_N, int P, int rank, int*& d_I, int*& d_J, float*& d_val, float*& d_X, int nz, int N)
 {
-    // 1. counts + displs on rank 0 (needed for the Scatterv send side)
     std::vector<int> ccount(P,0), cdispl(P,0), xcount(P,0), xdispl(P,0);
     if (rank == 0)
     {
@@ -165,7 +160,6 @@ void scatter_in_place(int g_nz, int g_N, int P, int rank, int*& d_I, int*& d_J, 
         for (int r = 1; r < P; ++r) xdispl[r] = xdispl[r-1] + xcount[r-1];
     }
 
-    // 3. temporary recv buffers (sized by the known local counts)
     int   *r_I, *r_J;
     float *r_val, *r_X;
     cudaMalloc(&r_I,   nz * sizeof(int));
@@ -173,18 +167,15 @@ void scatter_in_place(int g_nz, int g_N, int P, int rank, int*& d_I, int*& d_J, 
     cudaMalloc(&r_val, nz * sizeof(float));
     cudaMalloc(&r_X,   N  * sizeof(float));
 
-    // 4. scatter (device ptrs for data, host arrays for counts/displs)
     MPI_Scatterv(d_I,   ccount.data(), cdispl.data(), MPI_INT,   r_I,   nz, MPI_INT,   0, MPI_COMM_WORLD);
     MPI_Scatterv(d_J,   ccount.data(), cdispl.data(), MPI_INT,   r_J,   nz, MPI_INT,   0, MPI_COMM_WORLD);
     MPI_Scatterv(d_val, ccount.data(), cdispl.data(), MPI_FLOAT, r_val, nz, MPI_FLOAT, 0, MPI_COMM_WORLD);
     MPI_Scatterv(d_X,   xcount.data(), xdispl.data(), MPI_FLOAT, r_X,   N,  MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-    // 5. free rank 0's full arrays
     if (rank == 0) {
         cudaFree(d_I); cudaFree(d_J); cudaFree(d_val); cudaFree(d_X);
     }
 
-    // 6. rebind caller pointers to the slices
     d_I = r_I;  d_J = r_J;  d_val = r_val;  d_X = r_X;
 }
 
@@ -211,43 +202,32 @@ __global__ void gather_owned(const float* d_X, const int* d_in_cols, float* d_ou
         d_out_vals[t] = d_X[d_in_cols[t] / P];   // owned => j/P
 }
 
-// Halo (ghost) exchange split into a one-time PLAN and a per-iteration APPLY.
-//
-// The sparsity pattern is fixed, so "who needs which remote x-entries" and the
-// J remap are computed ONCE in halo_setup. Only the x VALUES change between
-// SpMV iterations, so halo_apply (gather owned values -> Alltoallv -> place
-// ghosts) is the repeatable per-SpMV communication that gets folded into the
-// timed loop.
+
 struct HaloPlan
 {
-    int P = 0;
-    int owned_X = 0;
-    int n_ghost = 0;        // remote x-entries this rank fetches  (recv volume)
-    int n_incoming = 0;     // x-entries this rank serves to others (send volume)
+    int P          = 0;
+    int owned_X    = 0;
+    int n_ghost    = 0;
+    int n_incoming = 0;
 
-    // host counts/displs for the per-iteration value Alltoallv
-    std::vector<int> sendcounts, sdispls;   // our requests  (recv side of values)
-    std::vector<int> recvcounts, rdispls;   // others' reqs  (send side of values)
+    std::vector<int> sendcounts, sdispls;
+    std::vector<int> recvcounts, rdispls;
 
-    // device buffers reused every iteration
-    int*   d_in_cols    = nullptr;   // size n_incoming: global cols others want
-    float* d_out_vals   = nullptr;   // size n_incoming: gathered owned values to send
-    float* d_ghost_vals = nullptr;   // size n_ghost   : received ghost values
+    int*   d_in_cols    = nullptr;   // size=n_incoming
+    float* d_out_vals   = nullptr;   // size=n_incoming
+    float* d_ghost_vals = nullptr;   // size=n_ghost
 };
 
-// One-time setup: builds the exchange plan, remaps d_J to index the extended x,
-// grows d_X to [owned ; ghosts], and allocates the reusable device buffers.
+
 HaloPlan halo_setup(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
 {
     HaloPlan plan;
     plan.P = P;
     plan.owned_X = owned_X;
 
-    // 1. columns to host
     std::vector<int> hJ(nz);
     cudaMemcpy(hJ.data(), d_J, nz * sizeof(int), cudaMemcpyDeviceToHost);
 
-    // 2. distinct ghost columns (sort + unique, no associative container)
     std::vector<int> req_cols;
     req_cols.reserve(nz);
     for (int k = 0; k < nz; ++k) {
@@ -257,7 +237,7 @@ HaloPlan halo_setup(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
     std::sort(req_cols.begin(), req_cols.end());
     req_cols.erase(std::unique(req_cols.begin(), req_cols.end()), req_cols.end());
 
-    // 3. per-owner sendcounts; re-bucket into owner-contiguous order for Alltoallv
+    // Per-owner sendcounts; re-bucket into owner-contiguous order for Alltoallv
     plan.sendcounts.assign(P, 0);
     plan.sdispls.assign(P, 0);
     for (int p = 0; p < (int)req_cols.size(); ++p) plan.sendcounts[req_cols[p] % P]++;
@@ -265,7 +245,7 @@ HaloPlan halo_setup(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
     plan.n_ghost = (int)req_cols.size();
 
     std::vector<int> req_by_owner(plan.n_ghost);
-    std::vector<int> slot_of_sorted(plan.n_ghost);   // appended slot, by sorted pos
+    std::vector<int> slot_of_sorted(plan.n_ghost);
     {
         std::vector<int> cursor = plan.sdispls;
         for (int p = 0; p < plan.n_ghost; ++p) {
@@ -276,7 +256,7 @@ HaloPlan halo_setup(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
         }
     }
 
-    // 4. tell each owner how many columns we want
+    // Tell each owner how many columns we want
     plan.recvcounts.assign(P, 0);
     plan.rdispls.assign(P, 0);
     MPI_Alltoall(plan.sendcounts.data(), 1, MPI_INT,
@@ -284,13 +264,13 @@ HaloPlan halo_setup(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
     for (int r = 1; r < P; ++r) plan.rdispls[r] = plan.rdispls[r-1] + plan.recvcounts[r-1];
     plan.n_incoming = plan.rdispls[P-1] + plan.recvcounts[P-1];
 
-    // 5. exchange the column lists (owner-grouped)
+    // Exchange the column lists (owner-grouped)
     std::vector<int> in_cols(plan.n_incoming);
     MPI_Alltoallv(req_by_owner.data(), plan.sendcounts.data(), plan.sdispls.data(), MPI_INT,
                   in_cols.data(),      plan.recvcounts.data(), plan.rdispls.data(), MPI_INT,
                   MPI_COMM_WORLD);
 
-    // 6. allocate reusable device buffers; upload the fixed in_cols once
+    // Allocate reusable device buffers; upload the fixed in_cols once
     cudaMalloc(&plan.d_in_cols,    (plan.n_incoming ? plan.n_incoming : 1) * sizeof(int));
     cudaMalloc(&plan.d_out_vals,   (plan.n_incoming ? plan.n_incoming : 1) * sizeof(float));
     cudaMalloc(&plan.d_ghost_vals, (plan.n_ghost    ? plan.n_ghost    : 1) * sizeof(float));
@@ -298,14 +278,14 @@ HaloPlan halo_setup(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
         cudaMemcpy(plan.d_in_cols, in_cols.data(), plan.n_incoming * sizeof(int),
                    cudaMemcpyHostToDevice);
 
-    // 7. grow d_X = [owned ; ghosts] (ghost region filled each iteration)
+    // Grow d_X = [owned ; ghosts] (ghost region filled each iteration)
     float* d_Xext = nullptr;
     cudaMalloc(&d_Xext, (owned_X + plan.n_ghost) * sizeof(float));
     cudaMemcpy(d_Xext, d_X, owned_X * sizeof(float), cudaMemcpyDeviceToDevice);
     cudaFree(d_X);
     d_X = d_Xext;
 
-    // 8. remap J once to index the extended x directly
+    // Remap J once to index the extended x directly
     for (int k = 0; k < nz; ++k) {
         int j = hJ[k];
         if (j % P == rank) {
@@ -326,9 +306,7 @@ HaloPlan halo_setup(int* d_J, float*& d_X, int nz, int owned_X, int P, int rank)
     return plan;
 }
 
-// Per-iteration value exchange: gather the owned x-values others requested,
-// Alltoallv them, and drop the received ghosts into the tail of d_X. Reuses the
-// plan's cached buffers and counts; this is the repeatable per-SpMV comm.
+// Per-iteration value exchange.
 void halo_apply(HaloPlan& plan, float* d_X)
 {
     if (plan.n_incoming > 0) {
@@ -336,7 +314,7 @@ void halo_apply(HaloPlan& plan, float* d_X)
         gather_owned<<<blocks, threads>>>(d_X, plan.d_in_cols, plan.d_out_vals,
                                           plan.n_incoming, plan.P);
     }
-    cudaDeviceSynchronize();   // gather must finish before MPI reads d_out_vals
+    cudaDeviceSynchronize(); // gather must finish before MPI reads d_out_vals.
 
     MPI_Alltoallv(plan.d_out_vals,   plan.recvcounts.data(), plan.rdispls.data(), MPI_FLOAT,
                   plan.d_ghost_vals, plan.sendcounts.data(), plan.sdispls.data(), MPI_FLOAT,
@@ -406,6 +384,7 @@ inline void display_card_informations(const int devCount, std::ostream& os = std
 
 #pragma region debug
 
+// Debug function made by Generative AI.
 void print_coo_local(const std::vector<int>& I,
                      const std::vector<int>& J,
                      const std::vector<float>& val,
@@ -463,6 +442,7 @@ void print_coo_local(const std::vector<int>& I,
     std::cout << "]\n";
 }
 
+// Debug function made by Generative AI.
 void debug_print_device(const int* d_I, const int* d_J,
                         const float* d_val, const float* d_X,
                         int nz, int N, int rank)
@@ -496,6 +476,7 @@ void debug_print_device(const int* d_I, const int* d_J,
     std::cout.flush();
 }
 
+// Debug function made by Generative AI.
 void debug_print_device_csr(const int* d_O, const int* d_J,
                             const float* d_val, const float* d_X,
                             int M, int nz, int N, int P, int rank)
@@ -579,9 +560,10 @@ int main(int argc, char ** argv)
     int local_dev = p % dev_count;
     CHECK_CUDA(cudaSetDevice(local_dev));
 
+    // Verify device-aware MPI.
     #if defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
     if (p == 0 && !MPIX_Query_cuda_support())
-        fprintf(stderr, "WARNING: MPI is not CUDA-aware at runtime\n");
+        fprintf(stderr, "WARNING: MPI is not device-aware at runtime\n");
     #endif
 
     // Executable must have a MTX file as arg.
@@ -591,12 +573,10 @@ int main(int argc, char ** argv)
         MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
     }
 
-    // Benchmark settings shared by the SpMV and MPI timing.
-    const int REPS    = 100;   // timed repetitions to average
-    const int WARMUPS = 5;     // untimed warm-up rounds before timing
+    const int REPS    = 30;
+    const int WARMUPS = 10;
 
-    // Prime the MPI subsystem so the first timed collective isn't penalized by
-    // one-time setup costs.
+
     mpi_warmup(WARMUPS);
 
     #pragma endregion init
@@ -629,12 +609,11 @@ int main(int argc, char ** argv)
 
     int* d_O = nullptr;
 
-    // --- timing accumulators (milliseconds) ---
-    double t_scatter    = 0.0;   // one-time: MPI matrix/vector scatter
-    double t_halo_setup = 0.0;   // one-time: halo plan construction
-    double t_gather     = 0.0;   // one-time: MPI result gather
-    double t_halo_iter  = 0.0;   // per-SpMV: halo value exchange (breakdown)
-    double t_spmv_iter  = 0.0;   // per-SpMV: local kernel          (breakdown)
+    double t_scatter    = 0.0; // one-time: MPI matrix/vector scatter
+    double t_halo_setup = 0.0; // one-time: halo plan construction
+    double t_gather     = 0.0; // one-time: MPI result gather
+    double t_halo_iter  = 0.0; // per-SpMV: halo value exchange
+    double t_spmv_iter  = 0.0; // per-SpMV: local kernel
 
     #pragma endregion variables
 
@@ -760,7 +739,7 @@ int main(int argc, char ** argv)
         cudaDeviceSynchronize();
     }
 
-    // --- timed (one-time): MPI scatter phase ---
+    // timed (one-time: MPI scatter phase.
     mpi_warmup(WARMUPS);
     MPI_Barrier(MPI_COMM_WORLD);
     {
@@ -786,7 +765,7 @@ int main(int argc, char ** argv)
 
     #pragma region halo_setup
 
-    // --- timed (one-time): halo plan construction ---
+    // timed (one-time): halo plan construction.
     HaloPlan plan;
     mpi_warmup(WARMUPS);
     MPI_Barrier(MPI_COMM_WORLD);
@@ -795,7 +774,7 @@ int main(int argc, char ** argv)
         plan = halo_setup(d_J, d_X, nz, owned_N, P, p);
         t_halo_setup = (MPI_Wtime() - t0) * 1000.0; // s -> ms
     }
-    const int n_ghost = plan.n_ghost;   // per-rank communication volume (recv)
+    const int n_ghost = plan.n_ghost; // per-rank communication volume (recv)
 
     #pragma endregion halo_setup
 
@@ -804,28 +783,23 @@ int main(int argc, char ** argv)
     cudaMalloc(&d_Y, M * sizeof(float));
     cudaMemset(d_Y, 0, M * sizeof(float));
 
-    threads = 128;                       // 4 warps/block
-    int warps_needed = M;                // one warp per local row
+    threads = 128;
+    int warps_needed = M;
     blocks = (warps_needed * 32 + threads - 1) / threads;
     size_t shmem = threads * sizeof(float);
 
-    // Warm-up: run the fused (halo + SpMV) iteration a few times untimed so
-    // caches, the MPI value path, and any one-time init are primed.
+    // Warmup.
     for (int w = 0; w < WARMUPS; ++w) {
         halo_apply(plan, d_X);
         spmv_gpu_csr_opt<<<blocks, threads, shmem>>>(d_O, d_J, d_val, M, d_X, d_Y);
     }
     cudaDeviceSynchronize();
 
-    // --- timed (per-SpMV): fused halo + kernel loop ---
-    // The halo value exchange is folded into the SpMV loop (it is the true
-    // per-iteration communication of a distributed SpMV). Halo and kernel are
-    // accumulated separately so the comm/compute breakdown is available; their
-    // sum is the per-SpMV execution time used for FLOP/s.
+    // timed (per-SpMV): fused halo + kernel loop.
     {
         GpuTimer gt;
-        double halo_accum_s = 0.0;   // seconds, per-rank
-        double spmv_accum_s = 0.0;   // seconds, per-rank
+        double halo_accum_s = 0.0;
+        double spmv_accum_ms = 0.0;
 
         MPI_Barrier(MPI_COMM_WORLD);
         for (int rep = 0; rep < REPS; ++rep) {
@@ -835,11 +809,11 @@ int main(int argc, char ** argv)
 
             gt.start();
             spmv_gpu_csr_opt<<<blocks, threads, shmem>>>(d_O, d_J, d_val, M, d_X, d_Y);
-            spmv_accum_s += (double)gt.stop_ms() / 1000.0;
+            spmv_accum_ms += (double)gt.stop_ms();
         }
 
-        t_halo_iter = halo_accum_s / REPS * 1000.0;   // avg ms per SpMV
-        t_spmv_iter = spmv_accum_s / REPS * 1000.0;   // avg ms per SpMV
+        t_halo_iter = (halo_accum_s / REPS) * 1000.0;
+        t_spmv_iter = (spmv_accum_ms / REPS);
     }
 
     #pragma endregion local_spmv
@@ -848,14 +822,14 @@ int main(int argc, char ** argv)
 
     std::vector<int> ycount(P, 0), ydispl(P, 0);
     if (p == 0) {
-        for (int r = 0; r < P; ++r) ycount[r] = (g_M - r + P - 1) / P;   // rows per rank
+        for (int r = 0; r < P; ++r) ycount[r] = (g_M - r + P - 1) / P;
         for (int r = 1; r < P; ++r) ydispl[r] = ydispl[r-1] + ycount[r-1];
     }
 
     float* d_Yfull = nullptr;
     if (p == 0) cudaMalloc(&d_Yfull, g_M * sizeof(float));
 
-    // --- timed (one-time): MPI gather phase ---
+    // timed (one-time): MPI gather phase.
     mpi_warmup(WARMUPS);
     MPI_Barrier(MPI_COMM_WORLD);
     {
@@ -872,11 +846,8 @@ int main(int argc, char ** argv)
 
         for (int r = 0; r < P; ++r)
             for (int l = 0; l < ycount[r]; ++l)
-                hY[l * P + r] = hYblock[ydispl[r] + l];   // block pos -> global row
-        // hY is now y in global row order
+                hY[l * P + r] = hYblock[ydispl[r] + l];
 
-        // NOTE: result output disabled during benchmarking so stdout carries
-        //       only the CSV. Re-enable to dump the y vector for validation.
         // std::ostringstream oss;
         // for (int i = 0; i < g_M; ++i) oss << hY[i] << "\n";
         // std::cout << oss.str();
@@ -886,8 +857,7 @@ int main(int argc, char ** argv)
 
     #pragma region metrics_output
 
-    // Per-phase wall-clock cost is the SLOWEST rank (a collective finishes only
-    // when the last participant does), so reduce phase times with MPI_MAX.
+
     double max_scatter, max_halo_setup, max_gather, max_halo_iter, max_spmv_iter;
     MPI_Reduce(&t_scatter,    &max_scatter,    1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&t_halo_setup, &max_halo_setup, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -895,13 +865,11 @@ int main(int argc, char ** argv)
     MPI_Reduce(&t_halo_iter,  &max_halo_iter,  1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&t_spmv_iter,  &max_spmv_iter,  1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    // Per-rank load balance: NNZ per rank (min / avg / max). Sum of local nz is
-    // g_nz, so avg = g_nz / P; reduce for the extremes.
+
     int nnz_min, nnz_max;
     MPI_Reduce(&nz, &nnz_min, 1, MPI_INT, MPI_MIN, 0, MPI_COMM_WORLD);
     MPI_Reduce(&nz, &nnz_max, 1, MPI_INT, MPI_MAX, 0, MPI_COMM_WORLD);
 
-    // Per-rank communication volume = ghost x-entries fetched (min / avg / max).
     int cv_min, cv_max;
     long long my_cv = (long long)n_ghost, cv_sum = 0;
     MPI_Reduce(&n_ghost, &cv_min, 1, MPI_INT,       MPI_MIN, 0, MPI_COMM_WORLD);
@@ -912,10 +880,8 @@ int main(int argc, char ** argv)
         const double nnz_avg = (double)g_nz  / P;
         const double cv_avg  = (double)cv_sum / P;
 
-        // Per-SpMV execution time = halo value exchange + local kernel.
         const double iter_ms = max_halo_iter + max_spmv_iter;
 
-        // SpMV does 2*nnz flops (one multiply + one add per nonzero).
         const double iter_s        = iter_ms / 1000.0;
         const double spmv_s        = max_spmv_iter / 1000.0;
         const double gflops        = (iter_s > 0.0) ? (2.0 * (double)g_nz / iter_s / 1e9) : 0.0;
