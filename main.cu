@@ -857,6 +857,14 @@ int main(int argc, char ** argv)
 
     #pragma region metrics_output
 
+    {
+        std::ostringstream ess;
+        ess << argv[1]<< "," << P << "," << p << ","
+            << std::scientific << std::setprecision(6)
+            << t_halo_iter << "," << t_spmv_iter << "\n";
+        std::cerr << ess.str();
+    }
+
 
     double max_scatter, max_halo_setup, max_gather, max_halo_iter, max_spmv_iter;
     MPI_Reduce(&t_scatter,    &max_scatter,    1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
